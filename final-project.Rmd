@@ -1,0 +1,361 @@
+---
+title: "Causal Impact of Moral Agency on Recidivism in Juvenile Delinquency"
+author: "Avianna Bui"
+output: github_document
+---
+
+
+```{r setup, include=FALSE, message = F, warning=F}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+library(dagitty)
+library(scales)
+library(ggdag)
+library(MatchIt)
+library(WeightIt)
+library(cobalt)
+library(marginaleffects)
+library(ltm)
+library(AIPW)
+library(SuperLearner)
+library(EValue)
+```
+
+## Research Questions
+
+I examine two research questions in this project: 
+
+  1. Explore the causal impact of moral agency on criminal behavior, specifically within the context of recidivism among juvenile delinquents. I define moral agency as the capability of moral decision-making and the willingness to be accountable for one’s behavior under a normative ethical framework. 
+  2. Investigate how internal moral frameworks intersect with social and systemic factors in influencing criminal behavior. To achieve this goal, I conduct a moderation analysis to examine the link between moral agency and recidivism under different social conditions, informed by two sociological theories of crime
+
+## Data Context & Transformation
+
+### Data Context
+
+My dataset is collected from the Florida Department of Juvenile Justice’s (FDJJ) Information System, which includes 7,117 juvenile probationers in Florida who have completed community supervision between July 2015 and June 2018. The FDJJ has a community-based placement program for youth with diversion and day treatment programs, probation supervision, and family therapy to aid the youth’s transition to the community. 
+The data comprises FDJJ’s demographical and criminal record data for each adolescent probationer as well as their C-PACT pre-screen evaluation results, which include information on their behavior at school and family settings, attitudes toward aggression and law, etc. The C-PACT is a semi-structured interview conducted by trained staff with corroboration by the adolescents’ families, teachers, etc. whenever possible. 
+
+```{r}
+pre_screen_data <- get(load("prescreen-data.rda"))
+```
+
+### Data Transformation
+
+After transforming the original data and filter out all cases with perfect moral agency score in both the 1st & 4th assessment, there are **5736** cases remain in my data, which is a relatively good sample size. 
+
+```{r}
+df <- pre_screen_data %>% 
+  filter(PACTNUMBER %in% c("(4) FOURTH PACT'", "(1) FIRST PACT")) %>%
+  mutate(LAWABIDING = case_when(LAWABIDING == "(1) Abides by conventions-values" ~ 5,
+                                LAWABIDING == "(2) Believes conventions-values sometimes apply" ~ 3,
+                                LAWABIDING == "(3) Does not believe or is hostile to conventional values" ~ 1)) %>%
+  mutate(NORESPONSIBILITY = case_when(NORESPONSIBILITY == "(1) Accepts responsibility for anti-social behavior" ~ 5,
+                                NORESPONSIBILITY == "(2) Minimizes, denies, justifies, excuses, or blames others" ~ 3,
+                                NORESPONSIBILITY == "(3) Accepts or is proud of Antisocial Behavior" ~ 1)) %>%
+  mutate(V_AGGRESS = case_when(V_AGGRESS == "(1) Believes verbal aggression is rarely appropriate" ~ 5,
+                                V_AGGRESS == "(2) Believes verbal aggression is sometimes appropriate" ~ 3,
+                                V_AGGRESS == "(3) Believes verbal aggression is often appropriate" ~ 1)) %>%
+  mutate(P_AGGRESS = case_when(P_AGGRESS == "(1) Believes physical aggression is never appropriate" ~ 5,
+                               P_AGGRESS == "(2) Believes physical aggression is rarely appropriate" ~ 4,
+                                P_AGGRESS == "(3) Believes physical aggression is sometimes appropriate" ~ 2,
+                                P_AGGRESS == "(4) Believes physical aggression is often appropriate" ~ 1)) 
+  
+df_2 <- df %>%
+  rowwise() %>%
+  mutate(MORALAGENCY = sum(c_across(c(34:37)))) %>%
+  dplyr::select(DJJID, PACTNUMBER, MORALAGENCY) %>%
+  pivot_wider(names_from = PACTNUMBER, values_from = MORALAGENCY)
+
+df_2 <- df_2 %>% 
+  mutate(CHANGEINAGENCY = df_2$`(4) FOURTH PACT'` - df_2$`(1) FIRST PACT`)
+
+final_data <- df %>%
+  filter(PACTNUMBER == "(4) FOURTH PACT'") %>%
+  left_join(df_2, by = c('DJJID' = 'DJJID')) %>%
+  filter(`(1) FIRST PACT` != 20 | CHANGEINAGENCY != 0) %>% # filter out all cases with perfect moral agency score in the 1st & 4th assessment
+  mutate(TREATMENT = factor(if_else(CHANGEINAGENCY > 0, 1, 0))) %>%
+  mutate(OUTCOME = factor(if_else(TCN_VOP == "(1) YES", 1, 0))) %>% 
+  mutate(AGEREL = round(AGEREL, digits = 0)) %>% # round age to a whole number
+  mutate(CONDUCT = factor(case_when(CONDUCT == "(1) Has received recognition for good behvr" ~ "Reported good conduct", 
+                                    CONDUCT == "(2) No probs in school conduct" ~ "No reported problem",
+                                    CONDUCT %in% c("(3) probs reported by teachers", "(4) Problem calls to parents", "(5) Calls to police") ~ "Reported problem in school conduct"))) %>%
+  mutate(CONDUCT = fct_relevel(CONDUCT, c("Reported good conduct", "No reported problem", "Reported problem in school conduct"))) %>%
+  mutate(SUBSTANCEUSE = factor(if_else(ALCOHOL == "(0) No use" | DRUGS == "(0) No use", "No", "Yes")))
+
+dim(final_data)
+```
+
+### Reliability Test: Cronbach's alpha
+
+Before proceeding with my analysis, I want to examine the reliability of my quantification of the 4 "moral agency" variables I utilize to calculate my moral agency score: (1) law-abidingness, (2) responsibility, attitude towards (3) verbal & (4) physical aggression
+
+Cronbach's alpha is a measure to estimate the inter-rater reliability of the items making up an instrument.  According to this method, a reliable instrument should demonstrate a high degree of covariance among the items relative to the overall variance. My Cronbach’s alpha is 0.722, suggesting acceptable internal consistency among the 4 items
+
+```{r}
+reli_df <- final_data %>%
+  dplyr::select(LAWABIDING, NORESPONSIBILITY, V_AGGRESS, P_AGGRESS)
+
+cronbach.alpha(reli_df, CI=TRUE)
+```
+
+## Causal Graph
+
+To block non-causal paths in my causal analysis, I use 9 variables that can potentially influence the relationship between moral agency and reoffense. These are the youth’s (1) gender, (2) race/ethnicity, (3) age at release, (4) number of previous felonies, (5) current friends, (6) school conduct, (7) level of parental authority and control, (8) neighborhood’s social disorganization level, and (9) substance usage.
+
+The mental health status of the juvenile delinquents is an unobserved confounder in my analysis. In a subsequent section, I conduct a sensitivity analysis to determine how strongly associated would mental health conditions (and other potential unobserved confounders) have to be with moral agency and recidivism to explain away the causal effect. 
+
+![](causal_graph.png)
+
+```{r, include = F}
+dag <- dagitty('dag {
+bb="-3.843,-4.569,4.087,6.453"
+"# Previous Felonies" [adjusted,pos="-1.820,-2.836"]
+"Age at Release" [adjusted,pos="-2.821,-0.579"]
+"Mental Health" [latent,pos="2.636,-2.816"]
+"Moral Agency" [exposure,pos="0.102,-2.876"]
+"Parental Authority" [adjusted,pos="-2.923,2.604"]
+"Race/Ethnicity" [adjusted,pos="-2.525,5.284"]
+"School Conduct" [adjusted,pos="3.045,2.040"]
+"Social Disorganization" [adjusted,pos="2.452,3.813"]
+"Socioeconomic Status" [latent,pos="3.045,5.405"]
+"Substance Use" [adjusted,pos="0.367,0.791"]
+Friends [adjusted,pos="3.392,-0.640"]
+Gender [adjusted,pos="1.042,5.284"]
+Recidivism [outcome,pos="-0.736,5.103"]
+"# Previous Felonies" -> "Moral Agency"
+"# Previous Felonies" -> Recidivism
+"Age at Release" -> "Moral Agency"
+"Age at Release" -> Recidivism
+"Mental Health" -> "Moral Agency"
+"Mental Health" -> Recidivism
+"Moral Agency" -> "Substance Use"
+"Moral Agency" -> Recidivism
+"Parental Authority" -> "Moral Agency"
+"Parental Authority" -> Recidivism
+"Race/Ethnicity" -> Recidivism
+"School Conduct" -> "Moral Agency"
+"School Conduct" -> Recidivism
+"Social Disorganization" -> "Moral Agency"
+"Social Disorganization" -> Recidivism
+"Socioeconomic Status" -> "Social Disorganization"
+"Substance Use" -> Recidivism
+Friends -> "Moral Agency"
+Friends -> Recidivism
+Gender -> Recidivism
+}
+')
+
+plot(dag)
+```
+
+## Causal Inference Analysis
+
+### Naive comparison: unadjusted difference in outcome across treatment groups
+
+According to the below density graph, the majority of juvenile delinquents in this dataset display no or minimal change in their moral agency score between the 1st and 4th (final) assessment
+
+```{r}
+final_data %>%
+  ggplot(aes(x = CHANGEINAGENCY)) +
+  geom_density() +
+  theme_bw()
+```
+
+A slightly lower proportion of juvenile delinquents who displayed a positive change in their moral agency score, compared to those who display no/negative change, are readjudicated within 365 days after their probation release, suggesting a small negative correlation between moral agency improvement and lowered recidivism.
+
+```{r}
+final_data %>%
+  ggplot(aes(x = TREATMENT, fill = TCN_VOP)) +
+  geom_bar(position = "fill") +
+  labs(y = "Recidivism Frequency", x = "Positive Change in Moral Agency", fill = "Readjudication") +
+  scale_x_discrete("Positive Change in Moral Agency",
+    labels = c(
+      "0" = "No",
+      "1" = "Yes"
+    )) +
+  scale_fill_manual(values = c('seagreen4', 'darkred')) +
+  theme_bw()
+```
+
+### Full matching
+
+I select optimal full matching since it has a good balance statistics while allowing me to employ employ all available data points in my analysis. Matching demonstrates a significant impact on the covariates’ balance, with significant imbalances between treatment groups pre-matching. However, the terms become much more balanced post-matching, with all covariates staying within the 0.1 absolute standardized mean difference (SMD) threshold. 
+
+```{r}
+match_out_full <- matchit(
+    OUTCOME ~ FEL + RACE_ETHNICITY + YOUTHGENDER + FRIENDS + OBEY + SUBSTANCEUSE + AGEREL + CONDUCT + C_SOCDISORG,
+    data = final_data,
+    method = "full",
+    distance = "glm",
+    estimand = "ATE" 
+)
+
+match_out_full_summ <- summary(match_out_full, interactions = TRUE)
+match_out_full_summ$nn
+```
+
+```{r fig.width=10, fig.height=25}
+plot(match_out_full_summ, cex = 0.5)
+```
+
+
+Common support: the ranges of propensity scores in which the treated and control units have non-zero density is the same, which is good and doesn’t raise any concerns about common support violations
+
+```{r}
+labs <- expression("Control", "Treated")
+  
+final_data %>%
+  mutate(ps = match_out_full$distance) %>%
+  ggplot(aes(x = ps, fill = factor(TREATMENT))) +
+  labs(x = "Propensity Score", y = "Density", fill = "Treatment Groups") +
+  scale_fill_manual(labels=labs,values=c('tomato','cyan3')) +
+  geom_density(alpha = 0.5) +
+  theme_bw()
+```
+
+The average treatment effect (ATE) estimates the effect of change in moral agency on recidivism amongst juvenile delinquents in the general population. We estimate that improvement in moral agency score lowers the risk of reoffending amongst the general Floridian juvenile delinquents population, with their risk of recidivism being 0.991 times as high as those who do not display improvement in moral agency. Since this exponentiated estimate is very close to 1, the 95% confidence interval contains 1, and the result has a very high p-value at 0.85, the result is statistically insignificant. Therefore, based on this result, we can’t be confident that moral agency improvement has a causal impact on reoffending likelihood in the general population. 
+
+```{r}
+match_data_full <- match.data(match_out_full)
+
+mod <- glm(OUTCOME ~ TREATMENT * (RACE_ETHNICITY + YOUTHGENDER + FRIENDS + OBEY + CONDUCT + C_SOCDISORG + FEL + SUBSTANCEUSE), data = match_data_full, weights = weights, family = quasibinomial)
+
+# compute risk ratio/relative risk
+avg_comparisons(
+    mod,
+    variables = "TREATMENT",
+    vcov = ~subclass,
+    comparison = "lnratioavg", #computes the marginal log risk ratio (RR)
+    transform = "exp" #exponentiates the marginal log RR and its confidence interval
+) 
+```
+
+### Doubly Robust Estimation with Augmented Inverse Probability Weighting (AIPW)
+
+Since full matching relies on the accuracy of the propensity score model to create matched sets, there is a risk that my propensity score model is misspecified. To address that concern, I examine the causal relationship between moral agency and recidivism using doubly robust estimation.
+
+As shown in the plots, the ranges of truncated propensity scores in the treated and control units do not raise any concerns about common support violations. The IP-weight ranges are relatively similar between the two groups (median at around 2) with no extreme weights (above 10 or much less than 1), so the AIPW model has an acceptable balance.
+
+```{r, warning = F, message=F}
+new_data <- final_data %>%
+  mutate(outcome = as.integer(ifelse(OUTCOME == 1, 1, 0))) %>%
+  mutate(treatment = as.integer(ifelse(TREATMENT == 1, 1, 0)))
+
+outcome <- new_data$outcome
+exposure <- new_data$treatment
+covariates_outcome <- new_data[, c("RACE_ETHNICITY", "YOUTHGENDER", "FRIENDS", "OBEY", "CONDUCT", "FEL", "SUBSTANCEUSE", "AGEREL", "C_SOCDISORG")]
+covariates_exposure <- new_data[, c("FRIENDS", "OBEY", "CONDUCT", "FEL", "SUBSTANCEUSE", "AGEREL", "C_SOCDISORG")]
+
+AIPW_SL <- AIPW$new(Y = outcome,
+                    A = exposure,
+                    W.Q = covariates_outcome,
+                    W.g = covariates_exposure, 
+                    Q.SL.library = c("SL.glm", "SL.glm.interaction", "SL.randomForest", "SL.ranger"),
+                    g.SL.library = c("SL.glm", "SL.glm.interaction", "SL.randomForest", "SL.ranger"),
+                    k_split = 3,
+                    verbose=FALSE)$
+  fit()$
+  summary(g.bound = 0.025)$ 
+  plot.p_score()$
+  plot.ip_weights()
+```
+
+The result of my doubly robust estimation model is very similar to my matching result, with the reoffending risk among the general Floridian juvenile delinquents population who display improved moral agency being 0.99 times as high as those who do not display improvement. The result is statistically insignificant with a 95% confidence interval passing 1. Since my matching and AIPW methods produce similar causal estimates, I have confidence that my matching result has good reliability. Given this, I proceed to use matching for my moderation analysis in the next section.
+
+```{r}
+print(AIPW_SL$result, digits = 2)
+```
+
+
+### Moderation Analysis
+
+The moderation analysis answers the second part of my research question, which is to explore how moral decision-making exerts influence on criminal behavior among youth with
+different sociological conditions. Moderation analysis entails determining whether a treatment effect displays meaningful differences across levels of a moderator variable, with a goal to achieving balance within each subgroup of the moderator. In my moderation analysis, I perform matching in the full dataset, utilizing the same GLM distance calculation while requiring exact matching on 2 moderating variables: school conduct and friends.
+
+#### Moderator: School Conduct
+
+```{r}
+mP_conduct <- matchit(TREATMENT ~ FEL + RACE_ETHNICITY + YOUTHGENDER + FRIENDS*CONDUCT + OBEY*CONDUCT + SUBSTANCEUSE*CONDUCT + C_SOCDISORG + AGEREL,
+              data = final_data,
+              exact = ~CONDUCT,
+              estimand = "ATE",
+              method = "full", 
+              distance = "glm")
+mP_conduct
+```
+
+The covariate balance plot suggests that the exact matched object has a relatively good overall balance, with the absolute SMDs of covariates within the 0.1 threshold point. Although the balance statistics table shows that a few covariates are not balanced (their standardized mean differences exceed the 0.05 threshold) within each subgroup of school conduct, the majority of covariates within each subgroup have good balance, and the resulting matched sample size is adequate for reliable analysis.
+
+```{r}
+cobalt::bal.tab(mP_conduct, cluster = "CONDUCT", stats = c("m", "v"), thresholds = c(m = .05))
+```
+
+```{r, fig.height=25, fig.width=10}
+mP_conduct_summ <- summary(mP_conduct, interactions = TRUE)
+plot(mP_conduct_summ, cex = 0.5)
+```
+
+
+Adolescents with good school conduct around the time of their final assessment have a statistically significant difference in their treatment effects: more specifically, among those with alleged good school conduct, the recidivizing risk of adolescents with improved moral agency score is 0.71 times the risk of adolescents who do not display improvement in moral agency. Since p-value is small (0.04) and the 95% CI doesn't overlap 1, we have some confidence that improved moral agency reduces reoffense among juvenile delinquents with good school conduct. The result suggests that community placement programs attempting to improve moral decision-making in juvenile delinquents are likely to be more effective in reducing reoffending risk among those who follow school regulations and likely have closer ties with educational institutions.
+
+
+```{r}
+mdP_conduct <- match.data(mP_conduct)
+
+fitP_conduct <- glm(OUTCOME ~ TREATMENT * CONDUCT, data = mdP_conduct, weights = weights, family = "quasibinomial")
+
+avg_comparisons(fitP_conduct, variables = "TREATMENT",
+                vcov = ~subclass,
+                by = "CONDUCT",
+                comparison = "lnratioavg",
+                transform = "exp")
+```
+
+#### Moderator: Friends
+
+```{r}
+mP_friend <- matchit(TREATMENT ~ FEL*FRIENDS + RACE_ETHNICITY*FRIENDS + YOUTHGENDER*FRIENDS + OBEY + SUBSTANCEUSE + C_SOCDISORG*FRIENDS + AGEREL + CONDUCT,
+              data = final_data,
+              exact = ~FRIENDS, 
+              estimand = "ATE",
+              method = "full")
+
+mP_friend
+```
+
+The covariate balance plot suggests that the exact matched object on Friends has a relatively good overall balance, with all covariates’ SMDs staying within the 0.1 threshold. Most subgroups of the moderator have good balance, with no covariate exceeding the 0.05 threshold, except for the “Exclusively Antisocial/Gang Member” subgroup, likely because this subgroup has the smallest sample size. Overall, the balance statistics and matched sample sizes within each subgroup are still relatively good according to the balance statistics table and absolute SMD plot.
+
+```{r}
+cobalt::bal.tab(mP_friend, cluster = "FRIENDS", stats = c("m", "v"), thresholds = c(m = .05))
+```
+```{r, fig.height=25, fig.width=10}
+mP_friend_summ <- summary(mP_friend, interactions = TRUE)
+plot(mP_friend_summ, cex = 0.5)
+```
+
+
+Across all subgroups of Friends, the estimates are close to 1, the results have high p-value (> 0.05) with a 95% CI containing 1, so the result is statistically insignificant and there doesn't seem to be differences in the causal effect of moral agency on recidivism across the types of friends the adolescents socialize with.
+
+```{r}
+mdP_friend <- match.data(mP_friend)
+
+fitP_friend <- glm(OUTCOME ~ TREATMENT * FRIENDS, data = mdP_friend, weights = weights, family = "quasibinomial")
+
+avg_comparisons(fitP_friend, variables = "TREATMENT",
+                vcov = ~subclass,
+                by = "FRIENDS",
+                comparison = "lnratioavg", 
+                transform = "exp")
+```
+
+### Sensitivity Analysis
+
+Since unmeasured confounders may lead to bias in my causal analysis, I want to investigate how strongly associated would mental health conditions have to be with moral agency and readjudication risk to explain away the causal relationship. To limit the scope of my sensitivity analysis to only statistically significant results, I only focus on examining the effect of unmeasured confounders, specifically mental health, on the link between moral agency and recidivism among adolescents with good school conduct in this section
+
+If the estimate of the relative risk is 0.711, the E-value of 2.16 indicates that mental health problems will have to be 2.16 times more common in reoffenders than non-reoffenders who display good school conduct to explain away the causal association. Meanwhile, if the RR estimate is 0.98 (upper end of CI), the E-value of 1.13 suggests that mental health problems will have to be 2.16 times more common in reoffenders than non-reoffenders with good school conduct. Since this upper-CI E-value, which represent the smallest amount of unmeasured confounders that could explain away our results, is close to 1, there is a possibility that unmeasured confounders like mental health conditions can account for the causal relationship between improved moral agency and recidivism among juvenile delinquents with good school behavior. However, I also expect mental health to have a slight to moderate correlation with substance use patterns in adolescents, which are controlled for in my causal analysis, so there's still likely a true causal relationship between change in moral agency and lowered recidivism rate among adolescents with good school discipline
+
+```{r}
+evalues.RR(est = 0.711, lo = 0.513, hi = 0.985)
+```

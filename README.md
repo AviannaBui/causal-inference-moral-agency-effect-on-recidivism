@@ -3,6 +3,7 @@
 ###### Project Area: Psychology, Sociology, Criminal Justice
 ###### Statistical Methods: Full Matching, Doubly Robust Estimation, Moderation Analysis & Sensitivity Analysis
 
+### Research Questions
 I examine two research questions in this project: 
   1. Explore the causal impact of moral agency on criminal behavior, specifically within the context of recidivism among juvenile delinquents. I define moral agency as the capability of moral decision-making and the willingness to be accountable for one’s behavior under a normative ethical framework. 
   2. Investigate how internal moral frameworks intersect with social and systemic factors in influencing criminal behavior. To achieve this goal, I conduct a moderation analysis to examine the link between moral agency and recidivism under different social conditions, informed by two sociological theories of crime. 
@@ -14,6 +15,8 @@ The Github Repository includes my Final Project Paper, which includes detailed d
 ### Instructions to Download the Dataset
 
 My dataset is collected from the Florida Department of Juvenile Justice’s (FDJJ) Information System, which includes 7,117 juvenile probationers in Florida who have completed community supervision between July 2015 and June 2018. The data, in addition to a detailed review of its context and the codebook, can be accessed at [this link](https://www.icpsr.umich.edu/web/ICPSR/studies/38599/datadocumentation). To download the dataset, select the Download button next to “DS1 Prescreen Analysis Dataset” as indicated in the image below, and click on the link for R to download the dataset in .rdata format.
+
+![](data-download-instruction.png)
 
 ### Packages to install in R
 
